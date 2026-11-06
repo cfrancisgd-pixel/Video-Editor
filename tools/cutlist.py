@@ -42,7 +42,7 @@ says so if it is not). The picture of a clip starts on the first source frame
 at or after "in", so an in point between two frames moves the picture up to
 one frame later than its sound.
 """
-import argparse, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile
+import argparse, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, time
 from fractions import Fraction
 
 XFADE_ALIASES = {"dissolve": "fade", "dip": "fadeblack", "fadeblack": "fadeblack",
@@ -58,23 +58,34 @@ LIMIT_NO_LOUDNESS = 20 * math.log10(0.89)  # "loudness": null keeps the level an
 LEVEL_TRIES = 5
 SILENCE_LUFS = -70.0     # ebur128's absolute gate: a mix this quiet (or silent) is left as it is
 MAX_GAIN_STEP = 6.0      # dB per try, so a heavily limited mix is not pushed far past the target
-SCENE_RECIPE = 2        # bump when the scene filter or encoder changes, so old scene files are not reused
+SCENE_RECIPE = 3        # bump when the scene filter or encoder changes, so old scene files are not reused
 SCENE_FILE = re.compile(r"^[0-9a-f]{16}(\.part)?\.mp4$")
 EXTRA_FRAMES = 2        # read a little past each piece; tpad + trim then make the frame count exact
 NO_INDEX = {"mpegts", "mpeg", "mpegvideo", "h264", "hevc"}  # camcorder .MTS/.M2TS, .VOB, raw streams
+# Source colour matrix -> the name FFmpeg 6 to 8 all accept in scale; untagged counts as BT.709 (HD)
+COLOR_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "fcc": "fcc",
+                "smpte240m": "smpte240m", "bt2020nc": "bt2020", "bt2020c": "bt2020"}
+HDR_TRANSFERS = {"arib-std-b67", "smpte2084"}  # HLG and PQ (iPhone HDR video)
 PREROLL = 1.0           # seconds decoded before each cut point, so the decoder has settled
 INLINE_GRAPH_MAX = 8000  # longer filter graphs go in a file (keeps the Windows command line short)
 
 
 def probe(src):
-    """Duration, whether it has sound, and whether FFmpeg can seek in it to a keyframe before a time."""
+    """Duration, whether it has sound, whether FFmpeg can seek in it to a keyframe before a time, and
+    the picture's colour matrix and transfer."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                          "stream=codec_type:format=duration,format_name", "-of", "json", src],
-                         capture_output=True, text=True, check=True).stdout
+                          "stream=codec_type,color_space,color_transfer:format=duration,format_name",
+                          "-of", "json", src], capture_output=True, text=True, check=True).stdout
     d = json.loads(out)
-    has_audio = any(s.get("codec_type") == "audio" for s in d.get("streams", []))
+    if "duration" not in d["format"]:
+        sys.exit(f"{src} has no duration FFmpeg can read (a raw stream, or WebM without cues); "
+                 f"remux it first: ffmpeg -i <file> -c copy <name>.mkv")
+    streams = d.get("streams", [])
+    video = next((st for st in streams if st.get("codec_type") == "video"), {})
     formats = set(d["format"].get("format_name", "").split(","))
-    return {"dur": float(d["format"]["duration"]), "audio": has_audio, "seekable": not formats & NO_INDEX}
+    return {"dur": float(d["format"]["duration"]), "audio": any(st.get("codec_type") == "audio" for st in streams),
+            "seekable": not formats & NO_INDEX, "matrix": COLOR_MATRIX.get(video.get("color_space"), "bt709"),
+            "hdr": video.get("color_transfer") in HDR_TRANSFERS}
 
 
 def seek_args(src_info, at, dur):
@@ -83,7 +94,7 @@ def seek_args(src_info, at, dur):
     scrub.py's silencedetect give them, also for camcorder files whose timestamps start later).
     Files without a seek index are read from the start (slower, but a seek there can land late)."""
     seek = max(0.0, at - PREROLL) if src_info["seekable"] else 0.0
-    return ["-ss", f"{seek:.6f}", "-t", f"{at - seek + dur:.6f}"]
+    return (["-ss", f"{seek:.6f}"] if seek > 0 else []) + ["-t", f"{at - seek + dur:.6f}"]
 
 
 def frame_rate(fps):
@@ -135,11 +146,13 @@ def plan(cfg):
     return timeline, end, rate
 
 
-def picture(label, start, sp, frames, cfg, rate, out):
-    """Trim one input at `start`, retime and conform it to the delivery raster, exactly `frames` frames long."""
+def picture(label, start, sp, frames, cfg, rate, out, matrix):
+    """Trim one input at `start`, retime and conform it to the delivery raster (BT.709, limited range,
+    converted from the source's own colour matrix), exactly `frames` frames long."""
     W, H = cfg.get("width", 1920), cfg.get("height", 1080)
     return (f"[{label}:v]trim=start={start:.6f},setpts=(PTS-STARTPTS)/{sp},"
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease:out_range=tv,"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:out_range=tv:"
+            f"in_color_matrix={matrix}:out_color_matrix=bt709,"
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate},format=yuv420p,"
             f"setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709,"
             f"tpad=stop=-1:stop_mode=clone,"
@@ -156,12 +169,13 @@ def scene(timeline, i, cfg, rate, info):
     """File name (a content hash) and FFmpeg command of clip i's scene file."""
     t = timeline[i]
     inputs = [(t["c"]["src"], t["in"], (t["N"] + EXTRA_FRAMES) * t["sp"] / rate)]
-    graph = [picture(0, t["in"], t["sp"], t["N"], cfg, rate, "cur")]
+    graph = [picture(0, t["in"], t["sp"], t["N"], cfg, rate, "cur", info[t["c"]["src"]]["matrix"])]
     if t["X"]:
         p = timeline[i - 1]
         tail = p["in"] + (p["L"] - t["X"]) * p["sp"] / rate
         inputs.append((p["c"]["src"], tail, (t["X"] + EXTRA_FRAMES) * p["sp"] / rate))
-        graph.append(picture(1, tail, p["sp"], t["X"] + EXTRA_FRAMES, cfg, rate, "prev"))
+        graph.append(picture(1, tail, p["sp"], t["X"] + EXTRA_FRAMES, cfg, rate, "prev",
+                             info[p["c"]["src"]]["matrix"]))
         graph.append(f"[prev][cur]xfade=transition={t['xtype']}:duration={float(t['X'] / rate):.6f}:offset=0,"
                      f"tpad=stop=-1:stop_mode=clone,trim=end_frame={t['N']}[v]")
     else:
@@ -337,7 +351,11 @@ def render_sound(pieces, cfg, total_s, work):
 
 
 def check_sources(cfg, info):
-    """Stop early when a clip starts before 0 s or at or after the end of its source."""
+    """Stop early when a clip starts before 0 s or at or after the end of its source; warn about HDR."""
+    for name, src in info.items():
+        if src["hdr"]:
+            print(f"warning: {name} is HDR (HLG or PQ); the cut is SDR BT.709 with no tone mapping, so it "
+                  f"will look flat. Convert it to SDR first.", file=sys.stderr)
     for i, c in enumerate(cfg["clips"]):
         src = info[c["src"]]
         if not 0 <= float(c["in"]) < src["dur"]:
@@ -366,8 +384,8 @@ def remove_unused(scenes_dir, keep):
         path = os.path.join(scenes_dir, name)
         if SCENE_FILE.match(name) and name not in keep:
             os.remove(path)
-        elif name.startswith("work-") and os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
+        elif name.startswith("work-") and os.path.isdir(path) and time.time() - os.path.getmtime(path) > 3600:
+            shutil.rmtree(path, ignore_errors=True)  # older than an hour: not another run's live folder
 
 
 def load(path):
