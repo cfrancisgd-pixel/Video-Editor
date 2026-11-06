@@ -32,9 +32,9 @@ def snap_rate(fps):
 
 
 def raster(src):
-    """Width, height and frame rate of the first video stream, as the picture is shown.
-    Falls back to 1920x1080 at 30 fps for audio-only sources."""
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+    """Width, height (made even, as libx264 needs) and frame rate of the first video stream, as the
+    picture is shown. Falls back to 1920x1080 at 30 fps for audio-only sources (V:0 skips cover art)."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
                           "stream=width,height,avg_frame_rate,r_frame_rate:stream_tags=rotate:"
                           "stream_side_data=rotation", "-of", "json", src],
                          capture_output=True, text=True, check=True).stdout
@@ -48,7 +48,7 @@ def raster(src):
     if abs(int(float(rot))) % 180 == 90:  # phone footage stored sideways; FFmpeg turns it upright
         w, h = h, w
     fps = parse_rate(v.get("avg_frame_rate")) or parse_rate(v.get("r_frame_rate")) or 30
-    return w, h, snap_rate(fps)
+    return w - w % 2, h - h % 2, snap_rate(fps)
 
 
 def main():
