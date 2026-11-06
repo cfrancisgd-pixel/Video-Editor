@@ -11,6 +11,8 @@ import numpy as np
 from common import decode_audio, ffmpeg, loudness, probe, run, speech_noise_gap
 
 SR = 16000
+CLEAN_GAP_DB = 28  # median voice above background at or above this: "fairly clean"
+NOISY_GAP_DB = 15  # below this: "very noisy"
 
 
 def band_pct(v, lo, hi):
@@ -19,9 +21,28 @@ def band_pct(v, lo, hi):
     return 100 * F[(f >= lo) & (f < hi)].sum() / (F.sum() + 1e-12)
 
 
-def channel_advice(x):
-    """Decide how to fold stereo to mono. Out-of-phase or unrelated channels thin the voice when mixed."""
-    if x.shape[1] < 2:
+def median_window_gap(mono, sr=SR, window_s=10):
+    """Median voice-above-background gap (dB) over fixed windows; None when no window has sound."""
+    w = int(window_s * sr)
+    gaps = [g for g in (speech_noise_gap(mono[i:i + w], sr)[2] for i in range(0, max(len(mono) - w + 1, 1), w))
+            if g is not None]
+    return float(np.median(gaps)) if gaps else None
+
+
+def gap_verdict(gap):
+    return "very noisy" if gap < NOISY_GAP_DB else "noticeable background" if gap < CLEAN_GAP_DB else "fairly clean"
+
+
+def audio_channels(path):
+    """Channel count of the first audio stream (decoding with -ac 2 makes mono look like stereo)."""
+    audio = [s for s in probe(path).get("streams", []) if s.get("codec_type") == "audio"]
+    return int(audio[0].get("channels") or 1) if audio else None
+
+
+def channel_advice(x, source_channels=None):
+    """Decide how to fold stereo to mono. Out-of-phase or unrelated channels thin the voice when mixed.
+    Pass the source's channel count so a mono source is not treated as two identical channels."""
+    if x.shape[1] < 2 or source_channels == 1:
         return "mix", "mono source"
     L, R = x[:, 0], x[:, 1]
     if L.std() == 0 or R.std() == 0:
@@ -53,7 +74,7 @@ def main():
 
     w = int(a.window * SR)
     print("\n  t(s)  L dB   R dB  L-R | noise  speech  gap | <150Hz%  >4kHz%")
-    gaps, lows, highs, imb = [], [], [], []
+    lows, highs, imb = [], [], []
     for i in range(0, max(len(x) - w + 1, 1), w):
         seg = x[i:i + w]
         m = seg.mean(1)
@@ -63,7 +84,7 @@ def main():
             continue
         lp, hp = band_pct(m, 0, 150), band_pct(m, 4000, 8000)
         d = db(seg[:, 0]) - db(seg[:, 1])
-        gaps.append(gap); lows.append(lp); highs.append(hp); imb.append(d)
+        lows.append(lp); highs.append(hp); imb.append(d)
         print(f"{i / SR:6.0f} {db(seg[:, 0]):6.1f} {db(seg[:, 1]):6.1f} {d:4.1f} | {lo:6.1f} {hi:6.1f} {gap:5.1f} | {lp:6.0f} {hp:8.2f}")
 
     sil = run([ffmpeg(), "-hide_banner", "-nostats", "-i", a.video, "-map", "0:a:0", "-af",
@@ -72,14 +93,13 @@ def main():
     ends = re.findall(r"silence_end: ([\d.]+) \| silence_duration: ([\d.]+)", sil)
 
     print("\nSUMMARY")
-    mode, why = channel_advice(x)
+    mode, why = channel_advice(x, audio_channels(a.video))
     print(f"- recommended --channel {mode}: {why}")
     if imb and (max(imb) - min(imb)) > 4:
         print(f"- left/right balance drifts {min(imb):.1f} to {max(imb):.1f} dB: voice wanders on headphones -> fold to mono")
-    if gaps:
-        g = float(np.median(gaps))
-        verdict = "very noisy" if g < 15 else "noticeable background" if g < 28 else "fairly clean"
-        print(f"- voice above background: median {g:.1f} dB ({verdict})")
+    g = median_window_gap(x.mean(1), SR, a.window)
+    if g is not None:
+        print(f"- voice above background: median {g:.1f} dB ({gap_verdict(g)})")
     if lows and max(lows) > 12:
         print(f"- low rumble (wind/traffic/AC/handling): up to {max(lows):.0f}% of energy below 150 Hz")
     if highs and np.median(highs) < 0.5:
