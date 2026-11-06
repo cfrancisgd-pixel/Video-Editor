@@ -11,6 +11,45 @@ Usage: python3 scrub.py interview.mp4 -o cut1.json [--noise -32] [--min-silence 
 """
 import argparse, json, os, re, subprocess
 
+COMMON_RATES = (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
+
+
+def parse_rate(text):
+    """'30000/1001' -> 29.97003; None for a missing or zero rate."""
+    try:
+        num, den = (float(x) for x in str(text).split("/")) if "/" in str(text) else (float(text), 1.0)
+    except ValueError:
+        return None
+    return num / den if num > 0 and den > 0 else None
+
+
+def snap_rate(fps):
+    """Round to a standard rate when within 1% (phones record slightly variable rates)."""
+    near = min(COMMON_RATES, key=lambda r: abs(r - fps))
+    if abs(near - fps) <= 0.01 * near:
+        return int(near) if near == int(near) else near
+    return round(fps, 3)
+
+
+def raster(src):
+    """Width, height and frame rate of the first video stream, as the picture is shown.
+    Falls back to 1920x1080 at 30 fps for audio-only sources."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=width,height,avg_frame_rate,r_frame_rate:stream_tags=rotate:"
+                          "stream_side_data=rotation", "-of", "json", src],
+                         capture_output=True, text=True, check=True).stdout
+    streams = json.loads(out).get("streams") or []
+    if not streams:
+        return 1920, 1080, 30
+    v = streams[0]
+    w, h = int(v["width"]), int(v["height"])
+    rot = v.get("tags", {}).get("rotate") or next(
+        (sd.get("rotation") for sd in v.get("side_data_list", []) if "rotation" in sd), 0)
+    if abs(int(float(rot))) % 180 == 90:  # phone footage stored sideways; FFmpeg turns it upright
+        w, h = h, w
+    fps = parse_rate(v.get("avg_frame_rate")) or parse_rate(v.get("r_frame_rate")) or 30
+    return w, h, snap_rate(fps)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -49,9 +88,11 @@ def main():
     rel = os.path.relpath(os.path.abspath(a.src), os.path.dirname(os.path.abspath(a.out)))
     clips = [{"src": rel, "in": round(s, 3), "out": round(e, 3)} for s, e in merged]
     kept = sum(e - s for s, e in merged)
-    json.dump({"width": 1920, "height": 1080, "fps": 30, "loudness": -14, "clips": clips},
-              open(a.out, "w"), indent=2)
-    print(f"{len(clips)} speech segments, {kept:.1f}s kept of {dur:.1f}s ({100 * kept / dur:.0f}%) -> {a.out}")
+    w, h, fps = raster(a.src)
+    with open(a.out, "w") as fh:
+        json.dump({"width": w, "height": h, "fps": fps, "loudness": -14, "clips": clips}, fh, indent=2)
+    print(f"{len(clips)} speech segments, {kept:.1f}s kept of {dur:.1f}s ({100 * kept / dur:.0f}%), "
+          f"{w}x{h} at {fps} fps -> {a.out}")
 
 
 if __name__ == "__main__":
