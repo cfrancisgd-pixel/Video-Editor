@@ -22,7 +22,7 @@ Duplicate the sequence/project at every stage (Cut 1, Cut 2, Skeleton, Build 1, 
 3. **Dialogue clean-up — Cut 2.** Two passes before any B-roll:
    - Pass 1 (low-hanging fruit): false starts and restarted sentences, "you know"/"um"/"err", repeated small phrases ("and the, and the"), multiple possible endings → pick one.
    - Pass 2 (fine tune): even out the rhythm — trim long thinking pauses, smooth machine-gun bursts, keep pauses consistent so the speaker sounds confident and intentional.
-   - Tighten toward target length (e.g. ~3 min → 1:45). Add text labels over each chunk naming its theme.
+   - Tighten toward target length (e.g. ~3 min → 1:45) and start judging where lines could go. Add text labels over each chunk naming its theme.
 4. **Skeleton.** Reorder bites into a narrative spine. Think like a writer, not an editor.
    - Frame: **setup → conflict → resolution.** Conflict can be an aspiration, a struggle or an internal tension. Resolution can be emotional or musical rather than literal — "how do I want to leave the viewer?"
    - Run the **But/So test** (section 3).
