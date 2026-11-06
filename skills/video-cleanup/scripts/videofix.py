@@ -125,6 +125,33 @@ def logo_xy(pos, margin_frac=0.06):
     }[pos]
 
 
+def still_input(path, fps):
+    # One decoded picture; hold() repeats it. "-loop 1" would decode the image again for every frame.
+    return ["-framerate", f"{fps}", "-i", path]
+
+
+def hold(seconds):
+    return f"loop=loop=-1:size=1,trim=duration={seconds}"
+
+
+def part_path(out):
+    """Temporary name next to the output that keeps its extension, so FFmpeg picks the same format."""
+    p = Path(out)
+    return str(p.with_name(f"{p.stem}.part{p.suffix or '.mp4'}"))
+
+
+def render(cmd, out):
+    """Run FFmpeg on the temporary name and rename only when it exits 0, so a stopped render
+    never leaves a short file under the real name."""
+    part = part_path(out)
+    try:
+        run(cmd)
+    except (SystemExit, KeyboardInterrupt):
+        Path(part).unlink(missing_ok=True)
+        raise
+    os.replace(part, out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("input"); ap.add_argument("-o", "--output")
@@ -153,6 +180,7 @@ def main():
     branded = a.logo or a.name or a.endcard
     out = a.output or default_out(a.input, "enhanced + branded" if branded else "enhanced")
     refuse_overwrite(a.input, out)
+    refuse_overwrite(a.input, part_path(out))
 
     info = probe(a.input)
     v = next(s for s in info["streams"] if s["codec_type"] == "video")
@@ -175,9 +203,9 @@ def main():
     if a.name:
         lt = Path(tmp) / "lowerthird.png"
         make_lower_third(lt, a.name, a.title, a.color, W, a.font)
-        idx = len(inputs); inputs.append(["-loop", "1", "-t", f"{a.lt_start + a.lt_dur + 0.5}", "-i", lt])
+        idx = len(inputs); inputs.append(still_input(lt, fps))
         s, e = a.lt_start, a.lt_start + a.lt_dur - 0.4
-        fc.append(f"[{idx}:v]format=rgba,fade=t=in:st={s}:d=0.4:alpha=1,"
+        fc.append(f"[{idx}:v]format=rgba,{hold(a.lt_start + a.lt_dur + 0.5)},fade=t=in:st={s}:d=0.4:alpha=1,"
                   f"fade=t=out:st={e}:d=0.4:alpha=1[lt]")
         x0 = int(W * 0.02)
         fc.append(f"[{cur}][lt]overlay=x='{x0}-{int(W*0.055)}*max(0,1-(t-{s})/0.4)*gte(t,{s})':"
@@ -187,9 +215,9 @@ def main():
     if a.logo:
         wm = Path(tmp) / "watermark.png"
         make_watermark(wm, a.logo, W, a.logo_width, a.logo_color)
-        idx = len(inputs); inputs.append(["-loop", "1", "-t", f"{D}", "-i", wm])
+        idx = len(inputs); inputs.append(still_input(wm, fps))
         x, y = logo_xy(a.logo_pos)
-        fc.append(f"[{idx}:v]format=rgba,colorchannelmixer=aa={a.logo_opacity}[wm]")
+        fc.append(f"[{idx}:v]format=rgba,colorchannelmixer=aa={a.logo_opacity},{hold(D)}[wm]")
         fc.append(f"[{cur}][wm]overlay=x={x}:y={y}:eof_action=pass[v2]")
         cur = "v2"
 
@@ -197,13 +225,15 @@ def main():
     if a.endcard:
         ec = Path(a.endcard)
         idx = len(inputs)
-        if ec.suffix.lower() in IMAGE_EXT:
-            inputs.append(["-loop", "1", "-t", f"{a.endcard_dur}", "-i", ec])
+        is_image = ec.suffix.lower() in IMAGE_EXT
+        if is_image:
+            inputs.append(still_input(ec, fps))
         else:
             inputs.append(["-ss", f"{a.endcard_start}", "-t", f"{a.endcard_dur}", "-i", ec])
+        held = f"{hold(a.endcard_dur)}," if is_image else ""
         fc.append(f"[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color={a.endcard_bg},fps={fps},"
-                  f"format=yuv420p,setsar=1,setpts=PTS-STARTPTS[ec]")
+                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color={a.endcard_bg},"
+                  f"format=yuv420p,setsar=1,{held}fps={fps},setpts=PTS-STARTPTS[ec]")
         off = max(0.0, D - a.fade)
         fc.append(f"[{cur}][ec]xfade=transition=fade:duration={a.fade}:offset={off}[v3]")
         cur = "v3"
@@ -226,8 +256,8 @@ def main():
         cmd += i
     cmd += ["-filter_complex", ";".join(fc), "-map", f"[{cur}]", *amap,
             "-c:v", "libx264", "-preset", "slow", "-crf", str(a.crf), "-profile:v", "high",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", f"{total}", out]
-    run(cmd)
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", f"{total}", part_path(out)]
+    render(cmd, out)
     print(f"wrote: {out}  ({W}x{H}, {total:.1f}s)")
 
 

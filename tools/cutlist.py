@@ -156,6 +156,25 @@ def build(cfg):
     return cmd, total, timeline
 
 
+def part_path(out):
+    """Temporary name next to the output that keeps its extension, so FFmpeg picks the same format."""
+    root, ext = os.path.splitext(out)
+    return f"{root}.part{ext or '.mp4'}"
+
+
+def render(cmd, out):
+    """Write to a temporary name and rename only when FFmpeg exits 0, so a stopped render
+    never leaves a short file under the real name."""
+    part = part_path(out)
+    try:
+        subprocess.run(cmd + [part], check=True)
+    except (subprocess.CalledProcessError, KeyboardInterrupt) as e:
+        if os.path.exists(part):
+            os.remove(part)
+        sys.exit(f"render stopped ({e.__class__.__name__}); {out} was not written")
+    os.replace(part, out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cutlist"); ap.add_argument("-o", "--out", default="cut.mp4")
@@ -173,7 +192,7 @@ def main():
     print(f"total {total:.3f}s")
     if a.dry_run:
         print(" ".join(cmd)); return
-    subprocess.run(cmd + [a.out], check=True)
+    render(cmd, a.out)
     print("wrote", a.out)
 
 
