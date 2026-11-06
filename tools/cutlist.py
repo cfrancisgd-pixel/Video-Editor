@@ -58,11 +58,11 @@ LIMIT_NO_LOUDNESS = 20 * math.log10(0.89)  # "loudness": null keeps the level an
 LEVEL_TRIES = 5
 SILENCE_LUFS = -70.0     # ebur128's absolute gate: a mix this quiet (or silent) is left as it is
 MAX_GAIN_STEP = 6.0      # dB per try, so a heavily limited mix is not pushed far past the target
-SCENE_RECIPE = 3        # bump when the scene filter or encoder changes, so old scene files are not reused
+SCENE_RECIPE = 4        # bump when the scene filter or encoder changes, so old scene files are not reused
 SCENE_FILE = re.compile(r"^[0-9a-f]{16}(\.part)?\.mp4$")
 EXTRA_FRAMES = 2        # read a little past each piece; tpad + trim then make the frame count exact
 NO_INDEX = {"mpegts", "mpeg", "mpegvideo", "h264", "hevc"}  # camcorder .MTS/.M2TS, .VOB, raw streams
-# Source colour matrix -> the name FFmpeg 6 to 8 all accept in scale; untagged counts as BT.709 (HD)
+# Source colour matrix -> the name FFmpeg 6 to 8 all accept in scale
 COLOR_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "fcc": "fcc",
                 "smpte240m": "smpte240m", "bt2020nc": "bt2020", "bt2020c": "bt2020"}
 HDR_TRANSFERS = {"arib-std-b67", "smpte2084"}  # HLG and PQ (iPhone HDR video)
@@ -74,18 +74,25 @@ def probe(src):
     """Duration, whether it has sound, whether FFmpeg can seek in it to a keyframe before a time, and
     the picture's colour matrix and transfer."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                          "stream=codec_type,color_space,color_transfer:format=duration,format_name",
+                          "stream=codec_type,height,color_space,color_transfer,color_primaries:format=duration,format_name",
                           "-of", "json", src], capture_output=True, text=True, check=True).stdout
     d = json.loads(out)
     if "duration" not in d["format"]:
         sys.exit(f"{src} has no duration FFmpeg can read (a raw stream, or WebM without cues); "
-                 f"remux it first: ffmpeg -i <file> -c copy <name>.mkv")
+                 "remux it first: ffmpeg -i <file> -c copy <name>.mp4")
     streams = d.get("streams", [])
     video = next((st for st in streams if st.get("codec_type") == "video"), {})
     formats = set(d["format"].get("format_name", "").split(","))
     return {"dur": float(d["format"]["duration"]), "audio": any(st.get("codec_type") == "audio" for st in streams),
-            "seekable": not formats & NO_INDEX, "matrix": COLOR_MATRIX.get(video.get("color_space"), "bt709"),
-            "hdr": video.get("color_transfer") in HDR_TRANSFERS}
+            "seekable": not formats & NO_INDEX, "matrix": color_matrix(video),
+            "hdr": video.get("color_transfer") in HDR_TRANSFERS, "wide": video.get("color_primaries") == "bt2020"}
+
+
+def color_matrix(video):
+    """The source's colour matrix as scale names it; untagged SD (576 lines or fewer) is BT.601, as
+    players read it, and untagged HD is BT.709."""
+    tagged = COLOR_MATRIX.get(video.get("color_space"))
+    return tagged or ("bt601" if int(video.get("height") or 1080) <= 576 else "bt709")
 
 
 def seek_args(src_info, at, dur):
@@ -355,7 +362,10 @@ def check_sources(cfg, info):
     for name, src in info.items():
         if src["hdr"]:
             print(f"warning: {name} is HDR (HLG or PQ); the cut is SDR BT.709 with no tone mapping, so it "
-                  f"will look flat. Convert it to SDR first.", file=sys.stderr)
+                  "will look flat. Convert it to SDR first.", file=sys.stderr)
+        elif src["wide"]:
+            print(f"warning: {name} uses BT.2020 colours; the cut is BT.709 and its colours are not mapped, "
+                  "so they will look washed out. Convert it to BT.709 first.", file=sys.stderr)
     for i, c in enumerate(cfg["clips"]):
         src = info[c["src"]]
         if not 0 <= float(c["in"]) < src["dur"]:
@@ -382,10 +392,11 @@ def remove_unused(scenes_dir, keep):
     (only names this script writes)."""
     for name in os.listdir(scenes_dir):
         path = os.path.join(scenes_dir, name)
-        if SCENE_FILE.match(name) and name not in keep:
+        old = time.time() - os.path.getmtime(path) > 3600  # older than an hour: not another run's live file
+        if SCENE_FILE.match(name) and name not in keep and (old or ".part" not in name):
             os.remove(path)
-        elif name.startswith("work-") and os.path.isdir(path) and time.time() - os.path.getmtime(path) > 3600:
-            shutil.rmtree(path, ignore_errors=True)  # older than an hour: not another run's live folder
+        elif name.startswith("work-") and os.path.isdir(path) and old:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def load(path):
