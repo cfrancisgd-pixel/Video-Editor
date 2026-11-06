@@ -153,6 +153,19 @@ class CutlistTest(unittest.TestCase):
     def test_music_not_ducked_when_off(self):
         self.assertLess(abs(self.ducking_gap(False)), 1.5)
 
+    def test_source_whose_timestamps_start_late(self):
+        # Camcorder .MTS files start at a time above 0; cut list times still count from the file's start.
+        ts = self.tmp / "late.ts"
+        ff("-i", self.tmp / "a.mkv", "-i", self.tmp / "b.mkv", "-filter_complex",
+           "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]", "-map", "[v]", "-map", "[a]",
+           "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-output_ts_offset", "1.4", ts)
+        out = self.render("late", [{"src": "late.ts", "in": 5.5, "out": 6.5}])
+        self.assertRed(color_at(out, 0.2))
+        self.assertBlue(color_at(out, 0.8))
+        audio = decode_mono(out)
+        self.assertGreater(tone_db(audio, 440, 0.1, 0.4), PRESENT_DB)
+        self.assertGreater(tone_db(audio, 1000, 0.6, 0.9), PRESENT_DB)
+
     def test_rerun_reencodes_only_changed_scenes(self):
         clips = [{"src": "a.mkv", "in": 0, "out": 1}, {"src": "b.mkv", "in": 0, "out": 1}]
         self.render("rerun", clips)

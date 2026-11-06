@@ -51,36 +51,39 @@ VIDEO_CODEC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt
 NTSC_RATES = {23.976: Fraction(24000, 1001), 29.97: Fraction(30000, 1001), 47.952: Fraction(48000, 1001),
               59.94: Fraction(60000, 1001), 119.88: Fraction(120000, 1001)}
 SR = 48000
-LUFS_TOLERANCE = 0.5     # the playbook allows 1 LU either side; aim inside half of that
+LUFS_TOLERANCE = 0.5     # the test allows 1 LU either side; aim inside half of that
 TRUE_PEAK_MAX = -1.0     # dBTP, measured on the encoded AAC
 LIMIT_START_DBFS = -1.5  # first limiter ceiling (sample peak); lowered if the AAC still peaks too high
 LIMIT_NO_LOUDNESS = 20 * math.log10(0.89)  # "loudness": null keeps the level and only catches peaks
 LEVEL_TRIES = 5
 SILENCE_LUFS = -70.0     # ebur128's absolute gate: a mix this quiet (or silent) is left as it is
 MAX_GAIN_STEP = 6.0      # dB per try, so a heavily limited mix is not pushed far past the target
-SCENE_RECIPE = 1        # bump when the scene filter or encoder changes, so old scene files are not reused
+SCENE_RECIPE = 2        # bump when the scene filter or encoder changes, so old scene files are not reused
 SCENE_FILE = re.compile(r"^[0-9a-f]{16}(\.part)?\.mp4$")
 EXTRA_FRAMES = 2        # read a little past each piece; tpad + trim then make the frame count exact
+NO_INDEX = {"mpegts", "mpeg", "mpegvideo", "h264", "hevc"}  # camcorder .MTS/.M2TS, .VOB, raw streams
 PREROLL = 1.0           # seconds decoded before each cut point, so the decoder has settled
 INLINE_GRAPH_MAX = 8000  # longer filter graphs go in a file (keeps the Windows command line short)
 
 
 def probe(src):
-    """Duration, whether it has sound, and its first timestamp (cut list times are timestamps)."""
+    """Duration, whether it has sound, and whether FFmpeg can seek in it to a keyframe before a time."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                          "stream=codec_type:format=duration,start_time", "-of", "json", src],
+                          "stream=codec_type:format=duration,format_name", "-of", "json", src],
                          capture_output=True, text=True, check=True).stdout
     d = json.loads(out)
     has_audio = any(s.get("codec_type") == "audio" for s in d.get("streams", []))
-    fmt = d["format"]
-    return {"dur": float(fmt["duration"]), "audio": has_audio, "start": float(fmt.get("start_time") or 0)}
+    formats = set(d["format"].get("format_name", "").split(","))
+    return {"dur": float(d["format"]["duration"]), "audio": has_audio, "seekable": not formats & NO_INDEX}
 
 
 def seek_args(src_info, at, dur):
-    """Read [at, at + dur) of a source cheaply: seek to PREROLL before it, keep the source's own
-    timestamps (-copyts), and let trim/atrim cut at `at` exactly, as one long graph would."""
-    seek = max(0.0, at - src_info["start"] - PREROLL)
-    return ["-ss", f"{seek:.6f}", "-t", f"{at - src_info['start'] - seek + dur:.6f}"]
+    """Read [at, at + dur) of a source: seek to PREROLL before it, then trim/atrim cut at `at` exactly.
+    Used with -copyts -start_at_zero, so times count from the start of the file (as FFmpeg and
+    scrub.py's silencedetect give them, also for camcorder files whose timestamps start later).
+    Files without a seek index are read from the start (slower, but a seek there can land late)."""
+    seek = max(0.0, at - PREROLL) if src_info["seekable"] else 0.0
+    return ["-ss", f"{seek:.6f}", "-t", f"{at - seek + dur:.6f}"]
 
 
 def frame_rate(fps):
@@ -136,8 +139,10 @@ def picture(label, start, sp, frames, cfg, rate, out):
     """Trim one input at `start`, retime and conform it to the delivery raster, exactly `frames` frames long."""
     W, H = cfg.get("width", 1920), cfg.get("height", 1080)
     return (f"[{label}:v]trim=start={start:.6f},setpts=(PTS-STARTPTS)/{sp},"
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1,fps={rate},format=yuv420p,tpad=stop=-1:stop_mode=clone,"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:out_range=tv,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate},format=yuv420p,"
+            f"setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709,"
+            f"tpad=stop=-1:stop_mode=clone,"
             f"trim=end_frame={frames},setpts=PTS-STARTPTS[{out}]")
 
 
@@ -164,7 +169,7 @@ def scene(timeline, i, cfg, rate, info):
     key = {"recipe": SCENE_RECIPE, "codec": VIDEO_CODEC, "graph": graph,
            "inputs": [source_id(s) + [round(a, 6), round(d, 6)] for s, a, d in inputs]}
     name = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16] + ".mp4"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-nostdin", "-copyts"]
+    cmd = ["ffmpeg", "-y", "-v", "error", "-nostdin", "-copyts", "-start_at_zero"]
     for s, at, dur in inputs:
         cmd += [*seek_args(info[s], at, dur), "-i", s]
     cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-an", *VIDEO_CODEC]
@@ -181,7 +186,7 @@ def audio_pieces(timeline, info, rate, work):
         if c.get("mute") or not src["audio"]:
             continue
         j, l = float(c.get("j", 0)), float(c.get("l", 0))
-        a_in, a_out = max(src["start"], t["in"] - j * sp), min(src["start"] + src["dur"], t["out"] + l * sp)
+        a_in, a_out = max(0.0, t["in"] - j * sp), min(src["dur"], t["out"] + l * sp)
         place = float(t["S"] / rate) - (t["in"] - a_in) / sp
         if place < 0:  # a J lead on the first clip: drop the part before 0 s instead of shifting the sound
             a_in, place = a_in - place * sp, 0.0
@@ -195,7 +200,8 @@ def audio_pieces(timeline, info, rate, work):
                  f"aformat=sample_fmts=flt:sample_rates={SR}:channel_layouts=stereo,"
                  f"volume={float(c.get('volume', 1.0))},afade=t=in:d={fi},"
                  f"afade=t=out:st={max(0, a_dur - fo):.6f}:d={fo}")
-        cmd = ["ffmpeg", "-y", "-v", "error", "-nostdin", "-copyts", *seek_args(src, a_in, a_out - a_in),
+        cmd = ["ffmpeg", "-y", "-v", "error", "-nostdin", "-copyts", "-start_at_zero",
+               *seek_args(src, a_in, a_out - a_in),
                "-i", c["src"], "-vn", "-af", chain, "-c:a", "pcm_f32le"]
         pieces.append((cmd, name, round(place * SR)))
     return pieces
@@ -242,7 +248,7 @@ def measure(path):
     """Integrated loudness (LUFS) and true peak (dBTP) of a file's sound, from FFmpeg's ebur128."""
     err = subprocess.run(["ffmpeg", "-v", "info", "-nostats", "-nostdin", "-i", path, "-map", "0:a:0",
                           "-af", "ebur128=peak=true", "-f", "null", "-"], capture_output=True, text=True,
-                         check=True).stderr
+                         encoding="utf-8", errors="replace", check=True).stderr
     tail = err[err.rfind("Summary:"):]
     loud = re.search(r"I:\s+(-?[\d.]+|-inf)", tail).group(1)
     peak = re.search(r"Peak:\s+(-?[\d.]+|-inf)", tail).group(1)
@@ -285,13 +291,14 @@ def encode_sound(mix, lufs, n_samples, work):
 
 
 def graph_args(graph, work):
-    """-filter_complex inline when short; from a file when long (FFmpeg 7 or later reads -/option files)."""
+    """-filter_complex inline when short; from a file when long (-filter_complex_script: FFmpeg 8 calls it
+    old but still reads it, and FFmpeg 6 has no -/filter_complex)."""
     if len(graph) <= INLINE_GRAPH_MAX:
         return ["-filter_complex", graph]
     path = os.path.join(work, "mix-graph.txt")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(graph)
-    return ["-/filter_complex", path]
+    return ["-filter_complex_script", path]
 
 
 def part_path(out):
@@ -330,11 +337,11 @@ def render_sound(pieces, cfg, total_s, work):
 
 
 def check_sources(cfg, info):
-    """Stop early when a clip starts at or after the end of its source (it would have no picture)."""
+    """Stop early when a clip starts before 0 s or at or after the end of its source."""
     for i, c in enumerate(cfg["clips"]):
         src = info[c["src"]]
-        if float(c["in"]) >= src["start"] + src["dur"]:
-            sys.exit(f"clip {i}: in {c['in']} s is past the end of {c['src']} ({src['dur']:.3f} s)")
+        if not 0 <= float(c["in"]) < src["dur"]:
+            sys.exit(f"clip {i}: in {c['in']} s is outside {c['src']} (0 to {src['dur']:.3f} s)")
 
 
 def frame_count(path):
@@ -353,10 +360,14 @@ def render_scene(cmd, path, frames):
 
 
 def remove_unused(scenes_dir, keep):
-    """Delete scene files this cut list no longer uses (only names this script writes)."""
+    """Delete scene files this cut list no longer uses, and work folders a stopped run left behind
+    (only names this script writes)."""
     for name in os.listdir(scenes_dir):
+        path = os.path.join(scenes_dir, name)
         if SCENE_FILE.match(name) and name not in keep:
-            os.remove(os.path.join(scenes_dir, name))
+            os.remove(path)
+        elif name.startswith("work-") and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def load(path):
