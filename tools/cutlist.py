@@ -36,7 +36,9 @@ changed (and the clip after one, if it fades from it). The sound (J and L
 cuts, music, ducking, loudness) is built once for the whole edit and laid on
 with -c:v copy. Delete the .scenes folder to force a full re-render.
 
-The picture of a clip starts on the first source frame
+Loudness: gain plus a peak limiter, measured on the encoded AAC and corrected
+until it is within 0.5 LU of the target with peaks at most -1 dBTP (a warning
+says so if it is not). The picture of a clip starts on the first source frame
 at or after "in", so an in point between two frames moves the picture up to
 one frame later than its sound.
 """
@@ -49,7 +51,13 @@ VIDEO_CODEC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt
 NTSC_RATES = {23.976: Fraction(24000, 1001), 29.97: Fraction(30000, 1001), 47.952: Fraction(48000, 1001),
               59.94: Fraction(60000, 1001), 119.88: Fraction(120000, 1001)}
 SR = 48000
+LUFS_TOLERANCE = 0.5     # the playbook allows 1 LU either side; aim inside half of that
+TRUE_PEAK_MAX = -1.0     # dBTP, measured on the encoded AAC
+LIMIT_START_DBFS = -1.5  # first limiter ceiling (sample peak); lowered if the AAC still peaks too high
 LIMIT_NO_LOUDNESS = 20 * math.log10(0.89)  # "loudness": null keeps the level and only catches peaks
+LEVEL_TRIES = 5
+SILENCE_LUFS = -70.0     # ebur128's absolute gate: a mix this quiet (or silent) is left as it is
+MAX_GAIN_STEP = 6.0      # dB per try, so a heavily limited mix is not pushed far past the target
 SCENE_RECIPE = 1        # bump when the scene filter or encoder changes, so old scene files are not reused
 SCENE_FILE = re.compile(r"^[0-9a-f]{16}(\.part)?\.mp4$")
 EXTRA_FRAMES = 2        # read a little past each piece; tpad + trim then make the frame count exact
@@ -223,21 +231,56 @@ def mix_graph(pieces, cfg, total_s):
     return ";\n".join(f)
 
 
-def limiter(n_samples):
-    """Peaks only: level=0 keeps the gain as it is, latency=1 keeps the sound on time.
+def limiter(n_samples, gain_db=0.0, ceiling=LIMIT_NO_LOUDNESS):
+    """Gain, then a peak limiter: level=0 keeps the gain as set, latency=1 keeps the sound on time.
     A second of padding goes in so the limiter's look-ahead keeps the last samples; atrim takes it out."""
-    return (f"apad=pad_dur=1,alimiter=limit={10 ** (LIMIT_NO_LOUDNESS / 20):.5f}:level=0:latency=1,"
+    return (f"apad=pad_dur=1,volume={gain_db:.3f}dB,alimiter=limit={10 ** (ceiling / 20):.5f}:level=0:latency=1,"
             f"atrim=end_sample={n_samples}")
 
 
+def measure(path):
+    """Integrated loudness (LUFS) and true peak (dBTP) of a file's sound, from FFmpeg's ebur128."""
+    err = subprocess.run(["ffmpeg", "-v", "info", "-nostats", "-nostdin", "-i", path, "-map", "0:a:0",
+                          "-af", "ebur128=peak=true", "-f", "null", "-"], capture_output=True, text=True,
+                         check=True).stderr
+    tail = err[err.rfind("Summary:"):]
+    loud = re.search(r"I:\s+(-?[\d.]+|-inf)", tail).group(1)
+    peak = re.search(r"Peak:\s+(-?[\d.]+|-inf)", tail).group(1)
+    return float(loud), float(peak)
+
+
 def encode_sound(mix, lufs, n_samples, work):
-    """Encode the mix to AAC: one-pass loudnorm to `lufs` (-1 dBTP), or only the peak limiter. Returns the .m4a."""
+    """Encode the mix to AAC, levelled to `lufs` with peaks at most -1 dBTP, both measured on the AAC
+    itself (the encoder adds peak): gain plus a limiter, corrected and encoded again until both hold.
+    One-pass loudnorm missed this (-14.2 LUFS at -0.7 dBTP on a test cut). Returns the .m4a path."""
     out = os.path.join(work, "sound.m4a")
+    enc = ["-c:a", "aac", "-b:a", "192k"]
     if lufs is None:
-        level = limiter(n_samples)
-    else:
-        level = f"apad=pad_dur=1,loudnorm=I={lufs}:TP=-1.0:LRA=11,aresample={SR},atrim=end_sample={n_samples}"
-    render(["ffmpeg", "-y", "-v", "error", "-nostdin", "-i", mix, "-af", level, "-c:a", "aac", "-b:a", "192k"], out)
+        render(["ffmpeg", "-y", "-v", "error", "-nostdin", "-i", mix, "-af", limiter(n_samples), *enc], out)
+        return out
+    lufs, (start, _) = float(lufs), measure(mix)
+    if start <= SILENCE_LUFS:  # silence: nothing to level
+        render(["ffmpeg", "-y", "-v", "error", "-nostdin", "-i", mix, *enc], out)
+        return out
+    gain, ceiling, last = lufs - start, LIMIT_START_DBFS, None
+    for attempt in range(1, LEVEL_TRIES + 1):
+        render(["ffmpeg", "-y", "-v", "error", "-nostdin", "-i", mix,
+                "-af", limiter(n_samples, gain, ceiling), *enc], out)
+        loud, peak = measure(out)
+        print(f"loudness try {attempt}: gain {gain:+.2f} dB, limit {ceiling:.2f} dBFS -> "
+              f"{loud:.1f} LUFS, {peak:.1f} dBTP", flush=True)
+        if abs(loud - lufs) <= LUFS_TOLERANCE and peak <= TRUE_PEAK_MAX:
+            return out
+        # How much louder one more dB of gain made it last time (the limiter takes some back); 1 at first.
+        slope = 1.0
+        if last and gain != last[0] and ceiling == last[2]:
+            slope = min(1.0, max(0.3, (loud - last[1]) / (gain - last[0])))
+        last = (gain, loud, ceiling)
+        if peak > TRUE_PEAK_MAX:
+            ceiling -= peak - TRUE_PEAK_MAX + 0.1
+        gain += max(-MAX_GAIN_STEP, min(MAX_GAIN_STEP, (lufs - loud) / slope))
+    print(f"warning: loudness stopped at {loud:.1f} LUFS, {peak:.1f} dBTP after {LEVEL_TRIES} tries "
+          f"(target {lufs} LUFS, at most {TRUE_PEAK_MAX} dBTP)", file=sys.stderr)
     return out
 
 
