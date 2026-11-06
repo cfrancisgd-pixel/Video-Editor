@@ -23,4 +23,4 @@ Tools (`tools/`; on Windows use `py` where these say `python3`):
 
 Workflow: scrub → Cut 1 JSON → edit the JSON by hand for Cut 2 / Skeleton (reorder, trim, pick endings) → add music + J/L-cuts for Build 1 → add B-roll and HyperFrames graphics clips for Picture. Save each stage's JSON (cut1.json, cut2.json, skeleton.json, build1.json) — the duplicate-every-stage habit.
 Verified Nov 2026 on test footage: J-cut audio leads picture, L-cut audio trails into the next shot, dissolve/dip offsets correct, ducking works.
-Automated checks of the same (J and L cuts, dissolve, dip, ducking; a few seconds, needs only FFmpeg): `python3 -m unittest discover -s tests -v` from the repo root. Run them after changing `cutlist.py`.
+Automated checks of the same (J and L cuts, dissolve, dip, ducking, scene reuse, loudness; about 10 s, needs only FFmpeg): `python3 -m unittest discover -s tests -v` from the repo root. Run them after changing `cutlist.py`.

@@ -1,4 +1,4 @@
-"""Checks for tools/cutlist.py: J-cuts, L-cuts, dissolves and music ducking, on tiny synthetic clips.
+"""Checks for tools/cutlist.py: J-cuts, L-cuts, dissolves, music ducking, scene reuse and loudness, on tiny clips.
 
 Run from the repo root (needs ffmpeg and ffprobe, nothing else):
     python3 -m unittest discover -s tests -v        (Windows: py -m unittest discover -s tests -v)
@@ -152,6 +152,29 @@ class CutlistTest(unittest.TestCase):
 
     def test_music_not_ducked_when_off(self):
         self.assertLess(abs(self.ducking_gap(False)), 1.5)
+
+    def test_rerun_reencodes_only_changed_scenes(self):
+        clips = [{"src": "a.mkv", "in": 0, "out": 1}, {"src": "b.mkv", "in": 0, "out": 1}]
+        self.render("rerun", clips)
+        scenes = self.tmp / "rerun.scenes"
+        first = {p.name: p.stat().st_mtime_ns for p in scenes.glob("*.mp4")}
+        self.assertEqual(len(first), 2)
+        clips[1]["out"] = 1.5
+        out = self.render("rerun", clips)
+        second = {p.name: p.stat().st_mtime_ns for p in scenes.glob("*.mp4")}
+        self.assertEqual(len(second), 2, "the old scene file of clip 2 should be deleted")
+        self.assertEqual(len(set(first.items()) & set(second.items())), 1, "clip 1's scene file should be reused")
+        self.assertAlmostEqual(duration(out), 2.5, delta=1.5 / FPS)
+
+    def test_loudness_target_on_the_aac(self):
+        out = self.render("loud", [{"src": "a.mkv", "in": 0, "out": 3}], loudness=-14)
+        err = subprocess.run(["ffmpeg", "-nostats", "-i", str(out), "-map", "0:a", "-af", "ebur128=peak=true",
+                              "-f", "null", "-"], capture_output=True, text=True, check=True).stderr
+        summary = err[err.rfind("Summary:"):]
+        lufs = float(summary.split("I:")[1].split()[0])
+        peak = float(summary.split("Peak:")[1].split()[0])
+        self.assertAlmostEqual(lufs, -14, delta=1.0)
+        self.assertLessEqual(peak, -1.0)
 
 
 if __name__ == "__main__":
