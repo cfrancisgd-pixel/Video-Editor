@@ -14,7 +14,7 @@ Francis is a multimedia designer and video editor (6+ years). This folder holds 
 - Read `skills/documentary-editing-style/SKILL.md` before any edit or review.
 - Build order: dialogue scrub → Cut 2 → Skeleton (setup → conflict → resolution) → Build 1 (music/SFX, no B-roll) → B-roll and polish. Save each stage (cut1.json, cut2.json, skeleton.json, build1.json).
 - Footage cuts with FFmpeg via `tools/`. Motion graphics in HyperFrames (Remotion only if asked or the project is already Remotion).
-- CapCut edits: edit the CapCut project file directly, don't drive the CapCut app. Close CapCut first, back up the draft, write to a temporary file and swap it in, then check the draft opens.
+- CapCut edits: edit the CapCut project file directly, don't drive the CapCut app. Close CapCut first, back up the draft, write to a temporary file and swap it in, then ask Francis to open the draft.
 - Short-form 9:16 can stay tight but still needs a deliberate pace change at the key beat.
 
 ## Quick commands
