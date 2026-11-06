@@ -17,7 +17,7 @@ For every video edit request, motion graphics (titles, kinetic type, maps, chart
 
 Real footage editing (trims, assembly, J/L-cuts, transitions, music bed, loudness) is done with **FFmpeg**; HyperFrames stays on motion graphics. The final film = FFmpeg cut with HyperFrames graphics rendered and cut in as clips.
 
-Tools (`tools/`; need FFmpeg 7 or later, check with `ffmpeg -version`; on Windows use `py` where these say `python3`):
+Tools (`tools/`; on Windows use `py` where these say `python3`):
 - **scrub.py** — Cut 1 dialogue scrub. Runs silencedetect on an interview, keeps speech with 0.15 s handles, keeps pauses up to about 0.65 s, cuts longer silences down to 0.3 s, writes a cut list with the source's size and frame rate. `python3 tools/scrub.py interview.mp4 -o cut1.json`
 - **cutlist.py** — assembles any cut list. Frame-accurate trims, hard cuts or xfade transitions (dissolve, dip to black, wipes), J-cuts (`"j": seconds`), L-cuts (`"l": seconds`), per-clip speed and volume, mute, a looping music bed that ducks under dialogue (deeper under louder speech), conform to the cut list's size and frame rate (1920×1080/30, 9:16, 1:1...), loudness to −14 LUFS / −1 dBTP measured on the final AAC. `python3 tools/cutlist.py cuts.json -o cut.mp4` (`--dry-run` prints the timeline and which scenes are cached). It encodes one file per clip into `<output name>.scenes/` next to the output (`cut1.mp4` → `cut1.scenes/`) and joins them without re-encoding, so a re-run only re-encodes the clips that changed (and the next clip, if it fades from one); the sound is rebuilt each run. Delete that folder to force a full re-render.
 
